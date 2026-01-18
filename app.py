@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import requests
 from fastapi import FastAPI, HTTPException, Query, Depends, Header
 
-from tickers import UNIVERSE  # your list of NSE/BSE tickers like "TCS.NS"
+from tickers import UNIVERSE  # your list like ["TCS.NS", "RELIANCE.NS", ...]
 
 
 app = FastAPI(title="NSE/BSE News + EOD Stock Watchlist (STATELESS MVP)")
@@ -18,7 +18,7 @@ app = FastAPI(title="NSE/BSE News + EOD Stock Watchlist (STATELESS MVP)")
 # ----------------------------
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "").strip()
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "").strip()  # optional but recommended
-CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "1800"))  # default 30 min
+CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "1800"))  # default 30 minutes
 
 # Yahoo chart endpoint (no API key needed)
 YAHOO_CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
@@ -28,8 +28,8 @@ YAHOO_CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
 # In-memory cache
 # ----------------------------
 _cache: Dict[str, Any] = {
-    "watchlist": None,
-    "watchlist_ts": 0.0,
+    # IMPORTANT: cache key now depends on request params (incl. universe_limit)
+    "watchlist": {},    # key -> {"ts":..., "data":...}
     "prices": {},       # (ticker, days) -> {"ts":..., "data":...}
     "news": {},         # (ticker, limit, hours_back) -> {"ts":..., "data":...}
 }
@@ -42,23 +42,23 @@ def caution_block() -> Dict[str, Any]:
             "It is NOT investment advice, NOT a buy/sell recommendation, and does not guarantee returns.",
             "News sentiment is computed automatically (keyword-based) and can be wrong or incomplete.",
             "Always verify from primary sources (exchange filings, company announcements) and do your own research.",
-            "Markets involve risk. You may lose money."
+            "Markets involve risk. You may lose money.",
         ]
     }
 
 
 # ----------------------------
-# Small, dependency-free sentiment (keyword based)
+# Dependency-free sentiment (keyword-based)
 # ----------------------------
 _POS_WORDS = {
-    "beats", "beat", "surge", "record", "profit", "profits", "growth", "upgrades", "upgrade",
+    "beats", "beat", "surge", "record", "profit", "profits", "growth", "upgrade", "upgrades",
     "buyback", "dividend", "strong", "wins", "win", "order", "contract", "approval",
     "raises", "raised", "guidance", "expands", "expansion", "acquires", "acquisition"
 }
 _NEG_WORDS = {
     "miss", "misses", "fall", "falls", "drop", "drops", "loss", "losses", "weak",
     "downgrade", "downgrades", "cut", "cuts", "probe", "fraud", "scam", "lawsuit",
-    "penalty", "fine", "decline", "slump", "warning", "defaults", "default"
+    "penalty", "fine", "decline", "slump", "warning", "default", "defaults"
 }
 
 
@@ -94,10 +94,9 @@ def classify_sentiment(sent: Optional[float]) -> str:
 def fetch_yahoo_prices(ticker: str, days: int) -> Dict[str, Any]:
     """
     Fetch last `days` trading bars via Yahoo chart API (range auto-chosen).
-    Returns oldest->newest arrays.
+    Returns oldest->newest rows.
     """
-    # choose range big enough for requested days
-    # roughly: 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y
+    # Choose range big enough for requested trading days
     if days <= 7:
         rng = "1mo"
     elif days <= 35:
@@ -147,7 +146,7 @@ def fetch_yahoo_prices(ticker: str, days: int) -> Dict[str, Any]:
         d = dt.datetime.utcfromtimestamp(ts[i]).date().isoformat()
         rows.append({"date": d, "close": float(c), "volume": int(v) if v is not None else 0})
 
-    # keep last `days` rows
+    # Keep last `days` rows
     if len(rows) > days:
         rows = rows[-days:]
 
@@ -172,7 +171,7 @@ def get_prices_cached(ticker: str, days: int) -> Dict[str, Any]:
 def fetch_news_newsapi(ticker: str, limit: int, hours_back: int) -> Dict[str, Any]:
     """
     Fetch news from NewsAPI 'everything'. Requires NEWSAPI_KEY.
-    We query using the base symbol (e.g., "TCS" from "TCS.NS").
+    Query uses base symbol (e.g., "TCS" from "TCS.NS").
     """
     if not NEWSAPI_KEY:
         return {"ticker": ticker, "items": []}
@@ -188,9 +187,10 @@ def fetch_news_newsapi(ticker: str, limit: int, hours_back: int) -> Dict[str, An
         "pageSize": min(max(limit, 1), 50),
         "apiKey": NEWSAPI_KEY,
     }
+
     r = requests.get(url, params=params, timeout=25)
     if r.status_code != 200:
-        # fail soft
+        # fail soft (free tier often returns errors)
         return {"ticker": ticker, "items": []}
 
     js = r.json() or {}
@@ -231,7 +231,11 @@ def get_news_cached(ticker: str, limit: int, hours_back: int) -> Dict[str, Any]:
 # ----------------------------
 # Scoring (stateless)
 # ----------------------------
-def compute_score_from_series(ticker: str, prices: List[Dict[str, Any]], news_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+def compute_score_from_series(
+    ticker: str,
+    prices: List[Dict[str, Any]],
+    news_items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     closes = [p["close"] for p in prices if p.get("close") is not None]
     if len(closes) < 25:
         raise ValueError("not enough price history")
@@ -249,7 +253,7 @@ def compute_score_from_series(ticker: str, prices: List[Dict[str, Any]], news_it
 
     # risk = 30D vol proxy
     if len(closes) >= 31:
-        rets_1d = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(len(closes) - 30, len(closes))]
+        rets_1d = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(len(closes) - 30, len(closes))]
         mean = sum(rets_1d) / len(rets_1d)
         var = sum((x - mean) ** 2 for x in rets_1d) / max(1, len(rets_1d) - 1)
         vol = math.sqrt(var)
@@ -259,7 +263,6 @@ def compute_score_from_series(ticker: str, prices: List[Dict[str, Any]], news_it
 
     n_count = len(news_items)
     avg_sent = sum((n.get("sentiment") or 0.0) for n in news_items) / n_count if n_count else 0.0
-
     news_impact = (avg_sent * 60.0) + (min(n_count, 10) * 4.0)
 
     is_downtrend = (r5 < 0.0) and (r20 < 0.0)
@@ -309,27 +312,37 @@ def compute_score_from_series(ticker: str, prices: List[Dict[str, Any]], news_it
     }
 
 
-def build_watchlist(limit: int, news_limit: int, news_hours_back: int, price_days: int) -> Dict[str, Any]:
+# ----------------------------
+# Watchlist building + caching (NOW supports universe_limit)
+# ----------------------------
+def build_watchlist(
+    limit: int,
+    news_limit: int,
+    news_hours_back: int,
+    price_days: int,
+    universe_limit: int,
+) -> Dict[str, Any]:
     items = []
-    for ticker in UNIVERSE:
+
+    # Only scan first N tickers (free-tier friendly)
+    for ticker in UNIVERSE[:universe_limit]:
         try:
             p = get_prices_cached(ticker, days=price_days)
             n = get_news_cached(ticker, limit=news_limit, hours_back=news_hours_back)
             score = compute_score_from_series(ticker, p["prices"], n["items"])
 
-            # attach small news buckets for UI (top N)
+            # attach small news buckets for UI
             buckets = {"positive": [], "neutral": [], "negative": []}
-            for it in n["items"][:news_limit]:
+            for it in (n["items"][:news_limit] if news_limit > 0 else []):
                 buckets[it["bucket"]].append(it)
 
             score["news"] = {
                 "window_hours": news_hours_back,
                 "limit": news_limit,
-                "buckets": buckets
+                "buckets": buckets,
             }
             items.append(score)
         except Exception:
-            # fail soft per ticker
             continue
 
     items.sort(key=lambda x: x["final_score"], reverse=True)
@@ -341,29 +354,50 @@ def build_watchlist(limit: int, news_limit: int, news_hours_back: int, price_day
         "notes": [
             "Data is computed on-demand and cached in memory (free-tier friendly).",
             "If the server restarts, cache clears and data is recomputed.",
+            "Universe scan is limited for speed on free tier.",
             "News sentiment is keyword-based; open sources to verify important claims.",
         ],
-        "items": items
+        "params": {
+            "limit": limit,
+            "price_days": price_days,
+            "news_limit": news_limit,
+            "news_hours_back": news_hours_back,
+            "universe_limit": universe_limit,
+            "universe_total": len(UNIVERSE),
+        },
+        "items": items,
     }
 
 
-def get_watchlist_cached(limit: int, news_limit: int, news_hours_back: int, price_days: int) -> Dict[str, Any]:
+def get_watchlist_cached(
+    limit: int,
+    news_limit: int,
+    news_hours_back: int,
+    price_days: int,
+    universe_limit: int,
+) -> Dict[str, Any]:
     now = time.time()
-    if _cache["watchlist"] and (now - _cache["watchlist_ts"] <= CACHE_TTL_SEC):
-        wl = _cache["watchlist"]
-        # If user asks smaller limit than cached, slice
-        wl2 = dict(wl)
-        wl2["items"] = wl["items"][:limit]
-        return wl2
 
-    wl = build_watchlist(limit=limit, news_limit=news_limit, news_hours_back=news_hours_back, price_days=price_days)
-    _cache["watchlist"] = wl
-    _cache["watchlist_ts"] = now
+    # Cache key depends on inputs (important)
+    key = (limit, news_limit, news_hours_back, price_days, universe_limit)
+
+    hit = _cache["watchlist"].get(key)
+    if hit and (now - hit["ts"] <= CACHE_TTL_SEC):
+        return hit["data"]
+
+    wl = build_watchlist(
+        limit=limit,
+        news_limit=news_limit,
+        news_hours_back=news_hours_back,
+        price_days=price_days,
+        universe_limit=universe_limit,
+    )
+    _cache["watchlist"][key] = {"ts": now, "data": wl}
     return wl
 
 
 # ----------------------------
-# Token dependency for refresh
+# Refresh auth dependency
 # ----------------------------
 def require_refresh_token(x_refresh_token: Optional[str] = Header(default=None)):
     # If REFRESH_TOKEN is not set, allow refresh (dev mode).
@@ -381,21 +415,30 @@ def require_refresh_token(x_refresh_token: Optional[str] = Header(default=None))
 def home():
     return {
         "message": "Stateless Stock MVP API is running",
-        "try": ["/docs", "/health", "/watchlist/today", "/company/TCS.NS?days=300", "/news/TCS.NS?limit=10"],
-        **caution_block()
+        "try": [
+            "/docs",
+            "/health",
+            "/watchlist/today?limit=20&universe_limit=60",
+            "/company/TCS.NS?days=300",
+            "/news/TCS.NS?limit=10&hours_back=72",
+        ],
+        **caution_block(),
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "date": dt.date.today().isoformat(), "cache_ttl_sec": CACHE_TTL_SEC}
+    return {
+        "status": "ok",
+        "date": dt.date.today().isoformat(),
+        "cache_ttl_sec": CACHE_TTL_SEC,
+        "universe_total": len(UNIVERSE),
+    }
 
 
 @app.post("/refresh")
 def refresh(_: bool = Depends(require_refresh_token)):
-    # clear caches
-    _cache["watchlist"] = None
-    _cache["watchlist_ts"] = 0.0
+    _cache["watchlist"].clear()
     _cache["prices"].clear()
     _cache["news"].clear()
     return {"ok": True, "message": "Cache cleared. Next request will recompute."}
@@ -406,10 +449,22 @@ def watchlist_today(
     limit: int = Query(default=20, ge=5, le=200),
     news_limit: int = Query(default=5, ge=0, le=20),
     news_hours_back: int = Query(default=72, ge=6, le=168),
-    price_days: int = Query(default=300, ge=30, le=600),
+    price_days: int = Query(default=120, ge=30, le=600),
+    universe_limit: int = Query(default=60, ge=5, le=500),
 ):
-    wl = get_watchlist_cached(limit=limit, news_limit=news_limit, news_hours_back=news_hours_back, price_days=price_days)
-    return wl
+    """
+    Free-tier friendly:
+    - Scans only first `universe_limit` tickers from UNIVERSE
+    - Uses cached Yahoo/News responses for CACHE_TTL_SEC
+    - Keep price_days small (e.g. 120) for watchlist ranking
+    """
+    return get_watchlist_cached(
+        limit=limit,
+        news_limit=news_limit,
+        news_hours_back=news_hours_back,
+        price_days=price_days,
+        universe_limit=universe_limit,
+    )
 
 
 @app.get("/company/{ticker}")
@@ -420,9 +475,13 @@ def company_detail(
     data = get_prices_cached(ticker, days=days)
     return {
         "ticker": ticker,
-        "meta": {"requested_days": days, "returned_days": len(data["prices"]), "asof_date": (data["prices"][-1]["date"] if data["prices"] else None)},
+        "meta": {
+            "requested_days": days,
+            "returned_days": len(data["prices"]),
+            "asof_date": (data["prices"][-1]["date"] if data["prices"] else None),
+        },
         "prices": data["prices"],
-        **caution_block()
+        **caution_block(),
     }
 
 

@@ -12,51 +12,62 @@ import plotly.graph_objects as go
 # ---------------------------
 # Config
 # ---------------------------
-API_BASE = os.getenv("API_BASE", "https://stock-mvp-q1xs.onrender.com").rstrip("/")
-REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "ankur123refresh").strip()
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000").rstrip("/")
+REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "").strip()
 
 
-def api_get(path: str, params=None):
+# ---------------------------
+# HTTP helpers (higher timeout for free-tier)
+# ---------------------------
+def api_get(path: str, params=None, timeout: int = 120):
     url = f"{API_BASE}{path}"
-    r = requests.get(url, params=params, timeout=30)
+    r = requests.get(url, params=params, timeout=timeout)
     try:
         return r.status_code, r.json()
     except Exception:
         return r.status_code, {"detail": "Non-JSON response", "text": r.text}
 
 
-def api_post(path: str, headers=None, params=None):
+def api_post(path: str, headers=None, params=None, timeout: int = 60):
     url = f"{API_BASE}{path}"
-    r = requests.post(url, headers=headers or {}, params=params, timeout=30)
+    r = requests.post(url, headers=headers or {}, params=params, timeout=timeout)
     try:
         return r.status_code, r.json()
     except Exception:
         return r.status_code, {"detail": "Non-JSON response", "text": r.text}
 
 
+# ---------------------------
+# Cached fetchers
+# ---------------------------
 @st.cache_data(ttl=60)
-def cached_watchlist(limit: int, news_limit: int, news_hours_back: int, price_days: int):
+def cached_watchlist(limit: int, news_limit: int, news_hours_back: int, watchlist_price_days: int, universe_limit: int):
     return api_get(
         "/watchlist/today",
         params={
             "limit": limit,
             "news_limit": news_limit,
             "news_hours_back": news_hours_back,
-            "price_days": price_days,
+            "price_days": watchlist_price_days,   # IMPORTANT: smaller than detail history
+            "universe_limit": universe_limit,     # IMPORTANT: free-tier friendly
         },
+        timeout=180,  # watchlist may take longer on first compute
     )
 
 
 @st.cache_data(ttl=60)
 def cached_company(ticker: str, days: int):
-    return api_get(f"/company/{ticker}", params={"days": days})
+    return api_get(f"/company/{ticker}", params={"days": days}, timeout=120)
 
 
 @st.cache_data(ttl=60)
 def cached_news(ticker: str, limit: int, hours_back: int):
-    return api_get(f"/news/{ticker}", params={"limit": limit, "hours_back": hours_back})
+    return api_get(f"/news/{ticker}", params={"limit": limit, "hours_back": hours_back}, timeout=120)
 
 
+# ---------------------------
+# Utils
+# ---------------------------
 def risk_label(risk_value: float) -> str:
     if risk_value < 1.5:
         return "Low"
@@ -102,7 +113,7 @@ st.caption(f"Backend API: {API_BASE}")
 # ---------------------------
 st.sidebar.header("Controls")
 
-limit = st.sidebar.slider("How many stocks?", min_value=5, max_value=200, value=20, step=5)
+limit = st.sidebar.slider("How many stocks to show?", min_value=5, max_value=200, value=20, step=5)
 min_score = st.sidebar.slider("Min Final Score", min_value=-200, max_value=200, value=-200, step=10)
 max_risk = st.sidebar.slider("Max Risk (vol proxy)", min_value=0.0, max_value=10.0, value=10.0, step=0.5)
 
@@ -111,6 +122,7 @@ sent_filter = st.sidebar.multiselect(
     options=["Positive", "Neutral", "Negative"],
     default=["Positive", "Neutral", "Negative"],
 )
+
 risk_filter = st.sidebar.multiselect(
     "Risk Bucket",
     options=["Low", "Medium", "High"],
@@ -120,9 +132,15 @@ risk_filter = st.sidebar.multiselect(
 ticker_search = st.sidebar.text_input("Search ticker (e.g., TCS.NS)", value="").strip().upper()
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Data Window")
+st.sidebar.subheader("Free-tier performance")
 
-news_limit = st.sidebar.slider("News per stock", min_value=0, max_value=20, value=5, step=1)
+universe_limit = st.sidebar.slider("Universe size (tickers to scan)", 10, 200, 60, 10)
+watchlist_price_days = st.sidebar.selectbox("Watchlist price history (days)", [60, 90, 120, 200], index=2)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Details page")
+
+news_limit = st.sidebar.slider("News per stock (watchlist buckets)", min_value=0, max_value=20, value=5, step=1)
 news_hours_back = st.sidebar.selectbox("News window (hours)", [24, 48, 72, 96, 168], index=2)
 
 chart_days = st.sidebar.selectbox("Chart range (days)", [5, 10, 30, 60, 120], index=2)
@@ -138,7 +156,7 @@ if st.sidebar.button("🔄 Refresh Data Now"):
     headers = {}
     if REFRESH_TOKEN:
         headers["X-REFRESH-TOKEN"] = REFRESH_TOKEN
-    s, j = api_post("/refresh", headers=headers)
+    s, j = api_post("/refresh", headers=headers, timeout=60)
     if s == 200:
         st.sidebar.success("Cache cleared. Reloading…")
         st.cache_data.clear()
@@ -151,9 +169,10 @@ st.sidebar.write("API Docs:", f"{API_BASE}/docs")
 st.sidebar.write("Health:", f"{API_BASE}/health")
 
 # ---------------------------
-# Load watchlist
+# Load watchlist (with spinner)
 # ---------------------------
-status, data = cached_watchlist(limit, news_limit, news_hours_back, history_days)
+with st.spinner("Fetching watchlist (free-tier can be slow on first load)..."):
+    status, data = cached_watchlist(limit, news_limit, news_hours_back, watchlist_price_days, universe_limit)
 
 if status != 200:
     st.error(f"Backend error: {data}")
@@ -170,6 +189,11 @@ if caution:
     with st.expander("⚠️ Caution / Disclaimer", expanded=False):
         for line in caution:
             st.write("• " + line)
+
+# Show backend params (useful debug)
+params = data.get("params", {})
+if params:
+    st.caption(f"Backend params: {params}")
 
 # Apply filters
 filtered = []
@@ -238,7 +262,7 @@ with right:
         st.markdown("**Why today?**")
         st.info(sel.get("reason", "No reason available."))
 
-    # --- Prices ---
+    # --- Prices for selected ticker (more history than watchlist) ---
     s2, company = cached_company(selected_ticker, days=history_days)
     if s2 != 200:
         st.warning(f"Could not load price data: {company}")
@@ -282,7 +306,6 @@ with right:
     a4.metric("From Low", f"+{dist_from_lo:.2f}%")
     st.write(f"Position in range: **{pos:.1f}%** (0% = near low, 100% = near high)")
     st.progress(int(pos))
-
     st.caption(
         f"History fetched: requested={history_days}, returned={returned_days}. "
         f"For true 52-week metrics, returned should be ~252 trading days or more."
@@ -394,7 +417,7 @@ with right:
     else:
         st.info("No date data available for selection.")
 
-    # --- News (from backend) ---
+    # --- News ---
     st.markdown("#### 📰 News (latest)")
     s3, news = cached_news(selected_ticker, limit=25, hours_back=news_hours_back)
     if s3 != 200:
