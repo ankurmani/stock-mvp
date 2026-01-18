@@ -495,7 +495,7 @@ with right:
     # Full news feed (separate endpoint)
     # ---------------------------
     st.markdown("#### 📰 Full News Feed (from /news endpoint)")
-    s3, news = cached_news(selected_ticker, limit=25, hours_back=news_hours_back)
+    s3, news = cached_news(selected_ticker, limit=20, hours_back=news_hours_back)
     if s3 != 200:
         st.warning(f"Could not load news: {news}")
     else:
