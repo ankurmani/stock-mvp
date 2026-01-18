@@ -2,7 +2,6 @@ import os
 import requests
 import streamlit as st
 
-# Optional (recommended for table view)
 try:
     import pandas as pd
 except Exception:
@@ -10,18 +9,42 @@ except Exception:
 
 import plotly.graph_objects as go
 
+# ---------------------------
+# Config
+# ---------------------------
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000").rstrip("/")
+REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "").strip()
 
 
 def api_get(path: str, params=None):
     url = f"{API_BASE}{path}"
     r = requests.get(url, params=params, timeout=30)
-    return r.status_code, r.json()
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"detail": "Non-JSON response", "text": r.text}
+
+
+def api_post(path: str, headers=None, params=None):
+    url = f"{API_BASE}{path}"
+    r = requests.post(url, headers=headers or {}, params=params, timeout=30)
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"detail": "Non-JSON response", "text": r.text}
 
 
 @st.cache_data(ttl=60)
-def cached_watchlist(limit: int):
-    return api_get("/watchlist/today", params={"limit": limit})
+def cached_watchlist(limit: int, news_limit: int, news_hours_back: int, price_days: int):
+    return api_get(
+        "/watchlist/today",
+        params={
+            "limit": limit,
+            "news_limit": news_limit,
+            "news_hours_back": news_hours_back,
+            "price_days": price_days,
+        },
+    )
 
 
 @st.cache_data(ttl=60)
@@ -30,8 +53,8 @@ def cached_company(ticker: str, days: int):
 
 
 @st.cache_data(ttl=60)
-def cached_news(ticker: str, limit: int = 20):
-    return api_get(f"/news/{ticker}", params={"limit": limit})
+def cached_news(ticker: str, limit: int, hours_back: int):
+    return api_get(f"/news/{ticker}", params={"limit": limit, "hours_back": hours_back})
 
 
 def risk_label(risk_value: float) -> str:
@@ -50,16 +73,6 @@ def sentiment_label(news_impact: float) -> str:
     return "Neutral"
 
 
-def compute_moving_average(values, window: int):
-    if not values or window <= 1:
-        return None
-    ma = []
-    for i in range(len(values)):
-        start = max(0, i - window + 1)
-        ma.append(sum(values[start:i + 1]) / (i - start + 1))
-    return ma
-
-
 def safe_float(x, default=0.0):
     try:
         return float(x)
@@ -67,11 +80,21 @@ def safe_float(x, default=0.0):
         return default
 
 
+def compute_moving_average(values, window: int):
+    if not values or window <= 1:
+        return None
+    ma = []
+    for i in range(len(values)):
+        start = max(0, i - window + 1)
+        ma.append(sum(values[start : i + 1]) / (i - start + 1))
+    return ma
+
+
 # ---------------------------
 # Page setup
 # ---------------------------
-st.set_page_config(page_title="NSE/BSE Stock Watchlist (Interactive)", layout="wide")
-st.title("📈 NSE/BSE Stock Watchlist (Interactive MVP)")
+st.set_page_config(page_title="NSE/BSE Stock Watchlist (Stateless)", layout="wide")
+st.title("📈 NSE/BSE Stock Watchlist (Stateless MVP)")
 st.caption(f"Backend API: {API_BASE}")
 
 # ---------------------------
@@ -86,24 +109,42 @@ max_risk = st.sidebar.slider("Max Risk (vol proxy)", min_value=0.0, max_value=10
 sent_filter = st.sidebar.multiselect(
     "News Sentiment Bucket",
     options=["Positive", "Neutral", "Negative"],
-    default=["Positive", "Neutral", "Negative"]
+    default=["Positive", "Neutral", "Negative"],
 )
 risk_filter = st.sidebar.multiselect(
     "Risk Bucket",
     options=["Low", "Medium", "High"],
-    default=["Low", "Medium", "High"]
+    default=["Low", "Medium", "High"],
 )
 
 ticker_search = st.sidebar.text_input("Search ticker (e.g., TCS.NS)", value="").strip().upper()
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Charts")
+st.sidebar.subheader("Data Window")
 
-chart_days = st.sidebar.selectbox("Price/Volume range (days)", [5, 10, 30, 60, 120], index=2)
+news_limit = st.sidebar.slider("News per stock", min_value=0, max_value=20, value=5, step=1)
+news_hours_back = st.sidebar.selectbox("News window (hours)", [24, 48, 72, 96, 168], index=2)
+
+chart_days = st.sidebar.selectbox("Chart range (days)", [5, 10, 30, 60, 120], index=2)
 history_days = st.sidebar.selectbox("History to fetch (for 52W)", [120, 200, 300, 400, 600], index=2)
 
 show_ma20 = st.sidebar.checkbox("Show MA20", value=True)
 show_ma50 = st.sidebar.checkbox("Show MA50", value=False)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Backend")
+
+if st.sidebar.button("🔄 Refresh Data Now"):
+    headers = {}
+    if REFRESH_TOKEN:
+        headers["X-REFRESH-TOKEN"] = REFRESH_TOKEN
+    s, j = api_post("/refresh", headers=headers)
+    if s == 200:
+        st.sidebar.success("Cache cleared. Reloading…")
+        st.cache_data.clear()
+        st.rerun()
+    else:
+        st.sidebar.error(f"Refresh failed: {j}")
 
 st.sidebar.markdown("---")
 st.sidebar.write("API Docs:", f"{API_BASE}/docs")
@@ -112,39 +153,40 @@ st.sidebar.write("Health:", f"{API_BASE}/health")
 # ---------------------------
 # Load watchlist
 # ---------------------------
-status, data = cached_watchlist(limit)
+status, data = cached_watchlist(limit, news_limit, news_hours_back, history_days)
 
 if status != 200:
-    st.error(
-        "No watchlist found yet.\n\nRun:\n"
-        "`python ingest_prices.py`\n"
-        "`python ingest_news.py` (optional)\n"
-        "`python score.py`\n\n"
-        f"API says: {data}"
-    )
+    st.error(f"Backend error: {data}")
     st.stop()
 
-items = data.get("items", [])
+items = data.get("items", []) or []
 date = data.get("date", "")
 
 st.subheader(f"Today’s Watchlist — {date}")
 
+# Show caution if backend includes it
+caution = data.get("caution", None)
+if caution:
+    with st.expander("⚠️ Caution / Disclaimer", expanded=False):
+        for line in caution:
+            st.write("• " + line)
+
 # Apply filters
 filtered = []
 for it in items:
-    if it["final_score"] < min_score:
+    if it.get("final_score", -9999) < min_score:
         continue
-    if it["risk"] > max_risk:
+    if it.get("risk", 9999) > max_risk:
         continue
 
-    s_label = sentiment_label(it["news_impact"])
-    r_label = risk_label(it["risk"])
+    s_label = sentiment_label(it.get("news_impact", 0.0))
+    r_label = risk_label(it.get("risk", 0.0))
 
     if s_label not in sent_filter:
         continue
     if r_label not in risk_filter:
         continue
-    if ticker_search and ticker_search not in it["ticker"]:
+    if ticker_search and ticker_search not in it.get("ticker", ""):
         continue
 
     it2 = dict(it)
@@ -180,7 +222,7 @@ with left:
         st.json(filtered[:10])
 
 # ---------------------------
-# Right: details + charts + news
+# Right: details + chart + news
 # ---------------------------
 with right:
     st.markdown(f"### 🔍 Details: `{selected_ticker}`")
@@ -196,9 +238,7 @@ with right:
         st.markdown("**Why today?**")
         st.info(sel.get("reason", "No reason available."))
 
-    # ---------------------------
-    # Load company prices with days parameter
-    # ---------------------------
+    # --- Prices ---
     s2, company = cached_company(selected_ticker, days=history_days)
     if s2 != 200:
         st.warning(f"Could not load price data: {company}")
@@ -212,22 +252,17 @@ with right:
     meta = company.get("meta", {})
     returned_days = meta.get("returned_days", len(prices))
 
-    # full history arrays (for 52W)
     all_dates = [p["date"] for p in prices]
     all_closes = [safe_float(p.get("close")) for p in prices]
     all_volumes = [safe_float(p.get("volume"), default=0.0) for p in prices]
 
-    # chart arrays (last chart_days)
     dates = all_dates[-chart_days:] if len(all_dates) > chart_days else all_dates
     closes = all_closes[-chart_days:] if len(all_closes) > chart_days else all_closes
     volumes = all_volumes[-chart_days:] if len(all_volumes) > chart_days else all_volumes
 
-    # ---------------------------
-    # 52-week analysis (real if >=252 trading days)
-    # ---------------------------
+    # --- Range / 52W analysis ---
     range_label = "52-week" if returned_days >= 252 else f"{returned_days}-day (available) range"
     current = all_closes[-1] if all_closes else (closes[-1] if closes else 0.0)
-
     hi = max(all_closes) if all_closes else current
     lo = min(all_closes) if all_closes else current
 
@@ -245,146 +280,129 @@ with right:
     a2.metric(f"{range_label} High", f"{hi:.2f}")
     a3.metric("From High", f"{dist_from_hi:.2f}%")
     a4.metric("From Low", f"+{dist_from_lo:.2f}%")
-
     st.write(f"Position in range: **{pos:.1f}%** (0% = near low, 100% = near high)")
     st.progress(int(pos))
 
     st.caption(
         f"History fetched: requested={history_days}, returned={returned_days}. "
-        f"For true 52-week metrics, return should be ~252 trading days or more."
+        f"For true 52-week metrics, returned should be ~252 trading days or more."
     )
 
-    # ---------------------------
-    # Interactive Plotly chart: Price + Volume + MA + hover (amount per day)
-    # ---------------------------
+    # --- ONE interactive chart (price + MA + volume) ---
     st.markdown(f"#### 📉 Price + Volume (interactive) — last {min(chart_days, len(dates))} days")
 
     fig = go.Figure()
 
-    # Close price
-    fig.add_trace(go.Scatter(
-        x=dates,
-        y=closes,
-        mode="lines+markers",
-        name="Close",
-        hovertemplate="Date: %{x}<br>Close: %{y:.2f}<extra></extra>"
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=dates,
+            y=closes,
+            mode="lines+markers",
+            name="Close",
+            line=dict(width=3),
+            marker=dict(size=6),
+            hovertemplate="Date: %{x}<br>Close: %{y:.2f}<extra></extra>",
+        )
+    )
 
-    # Moving averages
     if show_ma20 and len(closes) >= 20:
         ma20 = compute_moving_average(closes, 20)
-        fig.add_trace(go.Scatter(
-            x=dates,
-            y=ma20,
-            mode="lines",
-            name="MA20",
-            hovertemplate="Date: %{x}<br>MA20: %{y:.2f}<extra></extra>"
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=ma20,
+                mode="lines",
+                name="MA20",
+                line=dict(width=2, dash="dot"),
+                hovertemplate="Date: %{x}<br>MA20: %{y:.2f}<extra></extra>",
+            )
+        )
 
     if show_ma50 and len(closes) >= 50:
         ma50 = compute_moving_average(closes, 50)
-        fig.add_trace(go.Scatter(
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=ma50,
+                mode="lines",
+                name="MA50",
+                line=dict(width=2, dash="dash"),
+                hovertemplate="Date: %{x}<br>MA50: %{y:.2f}<extra></extra>",
+            )
+        )
+
+    fig.add_trace(
+        go.Bar(
             x=dates,
-            y=ma50,
-            mode="lines",
-            name="MA50",
-            hovertemplate="Date: %{x}<br>MA50: %{y:.2f}<extra></extra>"
-        ))
-
-    # Volume on secondary axis
-    fig.add_trace(go.Scatter(
-    x=dates,
-    y=closes,
-    mode="lines+markers",
-    name="Close",
-    line=dict(width=3),
-    marker=dict(size=6),
-    hovertemplate="Date: %{x}<br>Close: %{y:.2f}<extra></extra>"
-))
-
+            y=volumes,
+            name="Volume",
+            opacity=0.30,
+            yaxis="y2",
+            hovertemplate="Date: %{x}<br>Volume: %{y:,.0f}<extra></extra>",
+        )
+    )
 
     fig.update_layout(
-    height=560,
-
-    # Axis titles
-    xaxis=dict(
-        title="Date",
-        titlefont=dict(size=16),
-        tickfont=dict(size=13),
-        rangeslider=dict(visible=False),
-    ),
-    yaxis=dict(
-        title="Close Price",
-        titlefont=dict(size=16),
-        tickfont=dict(size=13),
-    ),
-    yaxis2=dict(
-        title="Volume",
-        titlefont=dict(size=16),
-        tickfont=dict(size=13),
-        overlaying="y",
-        side="right",
-        showgrid=False,
-    ),
-
-    # Legend
-    legend=dict(
-        orientation="h",
-        yanchor="bottom",
-        y=1.12,
-        xanchor="right",
-        x=1,
-        font=dict(size=14),
-        bgcolor="rgba(255,255,255,0.7)",
-        bordercolor="rgba(0,0,0,0.2)",
-        borderwidth=1,
-    ),
-
-    # Hover labels
-    hoverlabel=dict(
-        font=dict(size=14),
-        bgcolor="white",
-        bordercolor="black"
-    ),
-
-    # General margins
-    margin=dict(l=60, r=60, t=70, b=60),
-
-    template="plotly_white",
-)
-
+        height=560,
+        template="plotly_white",
+        xaxis=dict(
+            title="Date",
+            titlefont=dict(size=16),
+            tickfont=dict(size=13),
+            rangeslider=dict(visible=False),
+        ),
+        yaxis=dict(
+            title="Close Price",
+            titlefont=dict(size=16),
+            tickfont=dict(size=13),
+        ),
+        yaxis2=dict(
+            title="Volume",
+            titlefont=dict(size=16),
+            tickfont=dict(size=13),
+            overlaying="y",
+            side="right",
+            showgrid=False,
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.12,
+            xanchor="right",
+            x=1,
+            font=dict(size=14),
+            bgcolor="rgba(255,255,255,0.7)",
+            bordercolor="rgba(0,0,0,0.2)",
+            borderwidth=1,
+        ),
+        hoverlabel=dict(font=dict(size=14), bgcolor="white", bordercolor="black"),
+        margin=dict(l=60, r=60, t=70, b=60),
+    )
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # ---------------------------
-    # Exact amount on a specific day (date selector)
-    # ---------------------------
+    # --- Exact value on a specific day ---
     st.markdown("#### 📅 Exact values on a specific day")
     if dates:
-        default_index = len(dates) - 1
-        chosen_date = st.selectbox("Select a date", options=list(dates), index=default_index)
-
+        chosen_date = st.selectbox("Select a date", options=list(dates), index=len(dates) - 1)
         idx = list(dates).index(chosen_date)
         close_val = closes[idx]
         vol_val = volumes[idx]
-
         m1, m2 = st.columns(2)
         m1.metric("Close", f"{close_val:.2f}")
         m2.metric("Volume", f"{vol_val:,.0f}")
     else:
         st.info("No date data available for selection.")
 
-    # ---------------------------
-    # News section
-    # ---------------------------
+    # --- News (from backend) ---
     st.markdown("#### 📰 News (latest)")
-    s3, news = cached_news(selected_ticker, limit=25)
+    s3, news = cached_news(selected_ticker, limit=25, hours_back=news_hours_back)
     if s3 != 200:
         st.warning(f"Could not load news: {news}")
     else:
         news_items = news.get("items", []) or []
         if not news_items:
-            st.write("No news stored. (Either you didn’t run `ingest_news.py` or API key missing.)")
+            st.write("No news available. (If using NewsAPI, set NEWSAPI_KEY on backend.)")
         else:
             pos_news, neu_news, neg_news = [], [], []
             for n in news_items:
@@ -396,11 +414,9 @@ with right:
                 else:
                     neu_news.append(n)
 
-            tab1, tab2, tab3 = st.tabs([
-                f"Positive ({len(pos_news)})",
-                f"Neutral ({len(neu_news)})",
-                f"Negative ({len(neg_news)})"
-            ])
+            tab1, tab2, tab3 = st.tabs(
+                [f"Positive ({len(pos_news)})", f"Neutral ({len(neu_news)})", f"Negative ({len(neg_news)})"]
+            )
 
             def render_news_block(items_block):
                 for n in items_block[:20]:
@@ -421,9 +437,6 @@ with right:
             with tab3:
                 render_news_block(neg_news)
 
-    # ---------------------------
-    # Caution / disclaimer
-    # ---------------------------
     st.markdown("---")
     st.warning(
         "⚠️ Caution: This tool provides information and automated scoring for learning/demo purposes. "
