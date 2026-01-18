@@ -12,14 +12,14 @@ import plotly.graph_objects as go
 # ---------------------------
 # Config
 # ---------------------------
-API_BASE = os.getenv("API_BASE", "https://stock-mvp-q1xs.onrender.com").rstrip("/")
-REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "ankur123refresh").strip()
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000").rstrip("/")
+REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "").strip()
 
 
 # ---------------------------
-# HTTP helpers (higher timeout for free-tier)
+# HTTP helpers (bigger timeouts)
 # ---------------------------
-def api_get(path: str, params=None, timeout: int = 120):
+def api_get(path: str, params=None, timeout: int = 180):
     url = f"{API_BASE}{path}"
     r = requests.get(url, params=params, timeout=timeout)
     try:
@@ -48,10 +48,10 @@ def cached_watchlist(limit: int, news_limit: int, news_hours_back: int, watchlis
             "limit": limit,
             "news_limit": news_limit,
             "news_hours_back": news_hours_back,
-            "price_days": watchlist_price_days,   # IMPORTANT: smaller than detail history
-            "universe_limit": universe_limit,     # IMPORTANT: free-tier friendly
+            "price_days": watchlist_price_days,
+            "universe_limit": universe_limit,
         },
-        timeout=180,  # watchlist may take longer on first compute
+        timeout=240,
     )
 
 
@@ -108,12 +108,14 @@ st.set_page_config(page_title="NSE/BSE Stock Watchlist (Stateless)", layout="wid
 st.title("📈 NSE/BSE Stock Watchlist (Stateless MVP)")
 st.caption(f"Backend API: {API_BASE}")
 
+
 # ---------------------------
 # Sidebar controls
 # ---------------------------
 st.sidebar.header("Controls")
 
 limit = st.sidebar.slider("How many stocks to show?", min_value=5, max_value=200, value=20, step=5)
+
 min_score = st.sidebar.slider("Min Final Score", min_value=-200, max_value=200, value=-200, step=10)
 max_risk = st.sidebar.slider("Max Risk (vol proxy)", min_value=0.0, max_value=10.0, value=10.0, step=0.5)
 
@@ -134,7 +136,7 @@ ticker_search = st.sidebar.text_input("Search ticker (e.g., TCS.NS)", value="").
 st.sidebar.markdown("---")
 st.sidebar.subheader("Free-tier performance")
 
-universe_limit = st.sidebar.slider("Universe size (tickers to scan)", 10, 200, 60, 10)
+universe_limit = st.sidebar.slider("Universe size (tickers to scan)", 5, 200, 20, 5)
 watchlist_price_days = st.sidebar.selectbox("Watchlist price history (days)", [60, 90, 120, 200], index=2)
 
 st.sidebar.markdown("---")
@@ -168,8 +170,9 @@ st.sidebar.markdown("---")
 st.sidebar.write("API Docs:", f"{API_BASE}/docs")
 st.sidebar.write("Health:", f"{API_BASE}/health")
 
+
 # ---------------------------
-# Load watchlist (with spinner)
+# Load watchlist
 # ---------------------------
 with st.spinner("Fetching watchlist (free-tier can be slow on first load)..."):
     status, data = cached_watchlist(limit, news_limit, news_hours_back, watchlist_price_days, universe_limit)
@@ -183,19 +186,32 @@ date = data.get("date", "")
 
 st.subheader(f"Today’s Watchlist — {date}")
 
-# Show caution if backend includes it
+# show caution
 caution = data.get("caution", None)
 if caution:
     with st.expander("⚠️ Caution / Disclaimer", expanded=False):
         for line in caution:
             st.write("• " + line)
 
-# Show backend params (useful debug)
-params = data.get("params", {})
-if params:
-    st.caption(f"Backend params: {params}")
+# show debug + params always (so you don't guess)
+with st.expander("🧪 Backend Debug (click to expand)", expanded=False):
+    st.json({"params": data.get("params", {}), "debug": data.get("debug", {})})
+    st.write("Backend returned items:", len(items))
 
+# If backend returned nothing, stop early with actionable info
+if len(items) == 0:
+    st.error("Backend returned 0 items. This means all tickers failed to fetch/score.")
+    dbg = data.get("debug", {})
+    if dbg:
+        st.write("Sample backend errors:")
+        st.json(dbg.get("sample_errors", []))
+        st.info(dbg.get("hint", ""))
+    st.stop()
+
+
+# ---------------------------
 # Apply filters
+# ---------------------------
 filtered = []
 for it in items:
     if it.get("final_score", -9999) < min_score:
@@ -218,16 +234,22 @@ for it in items:
     it2["risk_bucket"] = r_label
     filtered.append(it2)
 
+# If filtering removes everything, show why
+if not filtered:
+    st.warning("No stocks match your filters, but backend did return items.")
+    st.write("Try setting Min Final Score lower and Max Risk higher.")
+    st.write("Sample backend items (first 5):")
+    st.json(items[:5])
+    st.stop()
+
 left, right = st.columns([0.42, 0.58], gap="large")
+
 
 # ---------------------------
 # Left: selection + table
 # ---------------------------
 with left:
     st.markdown("### 📌 Stocks")
-    if not filtered:
-        st.warning("No stocks match your filters.")
-        st.stop()
 
     ticker_options = [
         f'{x["ticker"]}  |  score={x["final_score"]:.2f}  |  {x["sentiment_bucket"]}  |  risk={x["risk_bucket"]}'
@@ -245,8 +267,9 @@ with left:
     else:
         st.json(filtered[:10])
 
+
 # ---------------------------
-# Right: details + chart + news
+# Right: details + charts + news
 # ---------------------------
 with right:
     st.markdown(f"### 🔍 Details: `{selected_ticker}`")
@@ -262,7 +285,7 @@ with right:
         st.markdown("**Why today?**")
         st.info(sel.get("reason", "No reason available."))
 
-    # --- Prices for selected ticker (more history than watchlist) ---
+    # Prices (selected ticker)
     s2, company = cached_company(selected_ticker, days=history_days)
     if s2 != 200:
         st.warning(f"Could not load price data: {company}")
@@ -284,7 +307,7 @@ with right:
     closes = all_closes[-chart_days:] if len(all_closes) > chart_days else all_closes
     volumes = all_volumes[-chart_days:] if len(all_volumes) > chart_days else all_volumes
 
-    # --- Range / 52W analysis ---
+    # Range / 52W analysis
     range_label = "52-week" if returned_days >= 252 else f"{returned_days}-day (available) range"
     current = all_closes[-1] if all_closes else (closes[-1] if closes else 0.0)
     hi = max(all_closes) if all_closes else current
@@ -306,12 +329,9 @@ with right:
     a4.metric("From Low", f"+{dist_from_lo:.2f}%")
     st.write(f"Position in range: **{pos:.1f}%** (0% = near low, 100% = near high)")
     st.progress(int(pos))
-    st.caption(
-        f"History fetched: requested={history_days}, returned={returned_days}. "
-        f"For true 52-week metrics, returned should be ~252 trading days or more."
-    )
+    st.caption(f"History fetched: requested={history_days}, returned={returned_days}.")
 
-    # --- ONE interactive chart (price + MA + volume) ---
+    # ONE interactive chart (price + MA + volume)
     st.markdown(f"#### 📉 Price + Volume (interactive) — last {min(chart_days, len(dates))} days")
 
     fig = go.Figure()
@@ -404,20 +424,17 @@ with right:
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- Exact value on a specific day ---
+    # Exact value selector
     st.markdown("#### 📅 Exact values on a specific day")
-    if dates:
-        chosen_date = st.selectbox("Select a date", options=list(dates), index=len(dates) - 1)
-        idx = list(dates).index(chosen_date)
-        close_val = closes[idx]
-        vol_val = volumes[idx]
-        m1, m2 = st.columns(2)
-        m1.metric("Close", f"{close_val:.2f}")
-        m2.metric("Volume", f"{vol_val:,.0f}")
-    else:
-        st.info("No date data available for selection.")
+    chosen_date = st.selectbox("Select a date", options=list(dates), index=len(dates) - 1)
+    idx = list(dates).index(chosen_date)
+    close_val = closes[idx]
+    vol_val = volumes[idx]
+    m1, m2 = st.columns(2)
+    m1.metric("Close", f"{close_val:.2f}")
+    m2.metric("Volume", f"{vol_val:,.0f}")
 
-    # --- News ---
+    # News (separate endpoint)
     st.markdown("#### 📰 News (latest)")
     s3, news = cached_news(selected_ticker, limit=25, hours_back=news_hours_back)
     if s3 != 200:
