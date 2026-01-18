@@ -389,19 +389,16 @@ with right:
         height=560,
         template="plotly_white",
         xaxis=dict(
-            title="Date",
-            titlefont=dict(size=16),
+            title=dict(text="Date", font=dict(size=16)),
             tickfont=dict(size=13),
             rangeslider=dict(visible=False),
         ),
         yaxis=dict(
-            title="Close Price",
-            titlefont=dict(size=16),
+            title=dict(text="Close Price", font=dict(size=16)),
             tickfont=dict(size=13),
         ),
         yaxis2=dict(
-            title="Volume",
-            titlefont=dict(size=16),
+            title=dict(text="Volume", font=dict(size=16)),
             tickfont=dict(size=13),
             overlaying="y",
             side="right",
