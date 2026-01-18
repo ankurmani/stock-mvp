@@ -13,7 +13,17 @@ import plotly.graph_objects as go
 # Config
 # ---------------------------
 API_BASE = os.getenv("API_BASE", "https://stock-mvp-q1xs.onrender.com").rstrip("/")
+
+# IMPORTANT: do NOT hardcode tokens in code.
+# Prefer Streamlit Secrets or environment variables.
+# Streamlit Cloud: Settings -> Secrets -> add:
+# REFRESH_TOKEN = "yourtoken"
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "ankur123refresh").strip()
+if not REFRESH_TOKEN:
+    try:
+        REFRESH_TOKEN = (st.secrets.get("REFRESH_TOKEN", "") or "").strip()
+    except Exception:
+        REFRESH_TOKEN = ""
 
 
 # ---------------------------
@@ -69,6 +79,7 @@ def cached_news(ticker: str, limit: int, hours_back: int):
 # Utils
 # ---------------------------
 def risk_label(risk_value: float) -> str:
+    # risk is vol*100 heuristic
     if risk_value < 1.5:
         return "Low"
     if risk_value < 3.0:
@@ -77,6 +88,7 @@ def risk_label(risk_value: float) -> str:
 
 
 def sentiment_label(news_impact: float) -> str:
+    # news_impact is your scoring signal (not raw sentiment)
     if news_impact > 10:
         return "Positive"
     if news_impact < -10:
@@ -97,8 +109,24 @@ def compute_moving_average(values, window: int):
     ma = []
     for i in range(len(values)):
         start = max(0, i - window + 1)
-        ma.append(sum(values[start : i + 1]) / (i - start + 1))
+        ma.append(sum(values[start: i + 1]) / (i - start + 1))
     return ma
+
+
+def render_news_list(news_list, max_items=10):
+    if not news_list:
+        st.write("No articles.")
+        return
+    for n in news_list[:max_items]:
+        title = n.get("title", "")
+        src = n.get("source", "Unknown")
+        pub = n.get("published_at", "")
+        url = n.get("url", "")
+        sent = n.get("sentiment", None)
+        sent_txt = f"{sent:.2f}" if isinstance(sent, (int, float)) else "n/a"
+        st.markdown(f"- **{title}**  \n  *{src}* | {pub} | sentiment: `{sent_txt}`")
+        if url:
+            st.markdown(f"  ↳ {url}")
 
 
 # ---------------------------
@@ -108,23 +136,20 @@ st.set_page_config(page_title="NSE/BSE Stock Watchlist (Stateless)", layout="wid
 st.title("📈 NSE/BSE Stock Watchlist (Stateless MVP)")
 st.caption(f"Backend API: {API_BASE}")
 
-
 # ---------------------------
 # Sidebar controls
 # ---------------------------
 st.sidebar.header("Controls")
 
 limit = st.sidebar.slider("How many stocks to show?", min_value=5, max_value=200, value=20, step=5)
-
 min_score = st.sidebar.slider("Min Final Score", min_value=-200, max_value=200, value=-200, step=10)
 max_risk = st.sidebar.slider("Max Risk (vol proxy)", min_value=0.0, max_value=10.0, value=10.0, step=0.5)
 
 sent_filter = st.sidebar.multiselect(
-    "News Sentiment Bucket",
+    "News Sentiment Bucket (from News Impact)",
     options=["Positive", "Neutral", "Negative"],
     default=["Positive", "Neutral", "Negative"],
 )
-
 risk_filter = st.sidebar.multiselect(
     "Risk Bucket",
     options=["Low", "Medium", "High"],
@@ -146,7 +171,7 @@ news_limit = st.sidebar.slider("News per stock (watchlist buckets)", min_value=0
 news_hours_back = st.sidebar.selectbox("News window (hours)", [24, 48, 72, 96, 168], index=2)
 
 chart_days = st.sidebar.selectbox("Chart range (days)", [5, 10, 30, 60, 120], index=2)
-history_days = st.sidebar.selectbox("History to fetch (for 52W)", [120, 200, 300, 400, 600], index=2)
+history_days = st.sidebar.selectbox("History to fetch (for range/52W)", [120, 200, 300, 400, 600], index=2)
 
 show_ma20 = st.sidebar.checkbox("Show MA20", value=True)
 show_ma50 = st.sidebar.checkbox("Show MA50", value=False)
@@ -170,7 +195,6 @@ st.sidebar.markdown("---")
 st.sidebar.write("API Docs:", f"{API_BASE}/docs")
 st.sidebar.write("Health:", f"{API_BASE}/health")
 
-
 # ---------------------------
 # Load watchlist
 # ---------------------------
@@ -193,21 +217,28 @@ if caution:
         for line in caution:
             st.write("• " + line)
 
-# show debug + params always (so you don't guess)
+# show debug + params always
 with st.expander("🧪 Backend Debug (click to expand)", expanded=False):
     st.json({"params": data.get("params", {}), "debug": data.get("debug", {})})
     st.write("Backend returned items:", len(items))
 
-# If backend returned nothing, stop early with actionable info
+# If backend returned nothing, give recovery option
 if len(items) == 0:
     st.error("Backend returned 0 items. This means all tickers failed to fetch/score.")
     dbg = data.get("debug", {})
     if dbg:
         st.write("Sample backend errors:")
         st.json(dbg.get("sample_errors", []))
-        st.info(dbg.get("hint", ""))
-    st.stop()
 
+    st.warning("Try reducing Universe size to 5–10 and retry (Yahoo blocks cloud IPs sometimes).")
+    if st.button("Retry with universe_limit=10"):
+        st.cache_data.clear()
+        universe_limit = 10
+        with st.spinner("Retrying..."):
+            status2, data2 = cached_watchlist(limit, news_limit, news_hours_back, watchlist_price_days, universe_limit)
+        st.rerun()
+
+    st.stop()
 
 # ---------------------------
 # Apply filters
@@ -234,16 +265,13 @@ for it in items:
     it2["risk_bucket"] = r_label
     filtered.append(it2)
 
-# If filtering removes everything, show why
 if not filtered:
     st.warning("No stocks match your filters, but backend did return items.")
-    st.write("Try setting Min Final Score lower and Max Risk higher.")
-    st.write("Sample backend items (first 5):")
-    st.json(items[:5])
+    st.write("Sample backend items (first 10):")
+    st.json(items[:10])
     st.stop()
 
 left, right = st.columns([0.42, 0.58], gap="large")
-
 
 # ---------------------------
 # Left: selection + table
@@ -267,7 +295,6 @@ with left:
     else:
         st.json(filtered[:10])
 
-
 # ---------------------------
 # Right: details + charts + news
 # ---------------------------
@@ -285,7 +312,34 @@ with right:
         st.markdown("**Why today?**")
         st.info(sel.get("reason", "No reason available."))
 
+    # ---------------------------
+    # FAST NEWS: from watchlist response (if available)
+    # ---------------------------
+    st.markdown("#### ⚡ Quick news (from watchlist response)")
+    # Some backends attach news buckets per item; if present, show it here
+    if sel and isinstance(sel.get("news"), dict):
+        buckets = (sel.get("news", {}).get("buckets") or {})
+        pos_b = buckets.get("positive", [])
+        neu_b = buckets.get("neutral", [])
+        neg_b = buckets.get("negative", [])
+
+        t1, t2, t3 = st.tabs([
+            f"Positive ({len(pos_b)})",
+            f"Neutral ({len(neu_b)})",
+            f"Negative ({len(neg_b)})",
+        ])
+        with t1:
+            render_news_list(pos_b, max_items=10)
+        with t2:
+            render_news_list(neu_b, max_items=10)
+        with t3:
+            render_news_list(neg_b, max_items=10)
+    else:
+        st.caption("Watchlist response did not include per-stock news buckets (depends on backend build).")
+
+    # ---------------------------
     # Prices (selected ticker)
+    # ---------------------------
     s2, company = cached_company(selected_ticker, days=history_days)
     if s2 != 200:
         st.warning(f"Could not load price data: {company}")
@@ -307,7 +361,9 @@ with right:
     closes = all_closes[-chart_days:] if len(all_closes) > chart_days else all_closes
     volumes = all_volumes[-chart_days:] if len(all_volumes) > chart_days else all_volumes
 
-    # Range / 52W analysis
+    # ---------------------------
+    # Range / 52W analysis (transparent about available days)
+    # ---------------------------
     range_label = "52-week" if returned_days >= 252 else f"{returned_days}-day (available) range"
     current = all_closes[-1] if all_closes else (closes[-1] if closes else 0.0)
     hi = max(all_closes) if all_closes else current
@@ -331,7 +387,9 @@ with right:
     st.progress(int(pos))
     st.caption(f"History fetched: requested={history_days}, returned={returned_days}.")
 
+    # ---------------------------
     # ONE interactive chart (price + MA + volume)
+    # ---------------------------
     st.markdown(f"#### 📉 Price + Volume (interactive) — last {min(chart_days, len(dates))} days")
 
     fig = go.Figure()
@@ -421,7 +479,9 @@ with right:
 
     st.plotly_chart(fig, use_container_width=True)
 
+    # ---------------------------
     # Exact value selector
+    # ---------------------------
     st.markdown("#### 📅 Exact values on a specific day")
     chosen_date = st.selectbox("Select a date", options=list(dates), index=len(dates) - 1)
     idx = list(dates).index(chosen_date)
@@ -431,15 +491,23 @@ with right:
     m1.metric("Close", f"{close_val:.2f}")
     m2.metric("Volume", f"{vol_val:,.0f}")
 
-    # News (separate endpoint)
-    st.markdown("#### 📰 News (latest)")
+    # ---------------------------
+    # Full news feed (separate endpoint)
+    # ---------------------------
+    st.markdown("#### 📰 Full News Feed (from /news endpoint)")
     s3, news = cached_news(selected_ticker, limit=25, hours_back=news_hours_back)
     if s3 != 200:
         st.warning(f"Could not load news: {news}")
     else:
+        # If backend returns error info, show it
+        if isinstance(news, dict) and news.get("error"):
+            with st.expander("ℹ️ News provider error (click to expand)", expanded=False):
+                st.json(news.get("error"))
+
         news_items = news.get("items", []) or []
         if not news_items:
-            st.write("No news available. (If using NewsAPI, set NEWSAPI_KEY on backend.)")
+            st.write("No news returned for this ticker in this time window.")
+            st.caption("If you expect news: check NEWSAPI_KEY on Render, plan limits, or increase hours back.")
         else:
             pos_news, neu_news, neg_news = [], [], []
             for n in news_items:
@@ -455,24 +523,12 @@ with right:
                 [f"Positive ({len(pos_news)})", f"Neutral ({len(neu_news)})", f"Negative ({len(neg_news)})"]
             )
 
-            def render_news_block(items_block):
-                for n in items_block[:20]:
-                    title = n.get("title", "")
-                    src = n.get("source", "Unknown")
-                    pub = n.get("published_at", "")
-                    url = n.get("url", "")
-                    sent = n.get("sentiment", None)
-                    sent_txt = f"{sent:.2f}" if isinstance(sent, (int, float)) else "n/a"
-                    st.markdown(f"- **{title}**  \n  *{src}* | {pub} | sentiment: `{sent_txt}`")
-                    if url:
-                        st.markdown(f"  ↳ {url}")
-
             with tab1:
-                render_news_block(pos_news)
+                render_news_list(pos_news, max_items=20)
             with tab2:
-                render_news_block(neu_news)
+                render_news_list(neu_news, max_items=20)
             with tab3:
-                render_news_block(neg_news)
+                render_news_list(neg_news, max_items=20)
 
     st.markdown("---")
     st.warning(
