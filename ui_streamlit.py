@@ -12,8 +12,8 @@ import plotly.graph_objects as go
 # ---------------------------
 # Config
 # ---------------------------
-API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000").rstrip("/")
-REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "").strip()
+API_BASE = os.getenv("API_BASE", "https://stock-mvp-q1xs.onrender.com").rstrip("/")
+REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "ankur123refresh").strip()
 
 
 def api_get(path: str, params=None):
